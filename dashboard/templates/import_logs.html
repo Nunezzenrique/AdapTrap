@@ -92,7 +92,7 @@
 
         <div id="progress-actions" style="display:none; margin-top:12px;">
             <button class="btn btn-primary" id="train-btn" onclick="startTraining()" style="display:none;">
-                Run Model Training &amp; Scoring
+                Run Model Scoring
             </button>
             <span id="train-note" style="color:var(--text-muted); font-size:0.85em; margin-left:10px;"></span>
         </div>
@@ -170,8 +170,8 @@
             <div>
                 <h3 id="deploy-header-text">Ready to Deploy to Live System</h3>
                 <p id="deploy-description">
-                    Applies deduplication, pushes new BLOCK rules to live nftables,
-                    and routes ambiguous threats to the Analyst Review queue.
+                    Blocks the top-tier threats automatically (full source IP) and routes the
+                    next tier to the Analyst Review queue.
                 </p>
             </div>
             <button class="btn btn-primary" id="deploy-btn" onclick="startDeploy()">
@@ -385,25 +385,25 @@ async function startTraining() {
         const resp = await fetch(`/api/import/train/${_currentJobId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contamination: 0.05 }),
+            body: JSON.stringify({ contamination: 0.0175 }),
         });
 
         const data = await resp.json();
 
         if (!resp.ok || !data.ok) {
-            showToast('Training start failed: ' + (data.error ?? `HTTP ${resp.status}`), 'err');
+            showToast('Scoring start failed: ' + (data.error ?? `HTTP ${resp.status}`), 'err');
             trainBtn.disabled    = false;
-            trainBtn.textContent = 'Retry Training';
+            trainBtn.textContent = 'Retry Scoring';
             return;
         }
 
-        showToast('Training started — streaming output…', 'info');
+        showToast('Scoring started — streaming output…', 'info');
         startPolling();
 
     } catch (err) {
         showToast('Network error: ' + err.message, 'err');
         trainBtn.disabled    = false;
-        trainBtn.textContent = 'Retry Training';
+        trainBtn.textContent = 'Retry Scoring';
     }
 }
 
@@ -459,15 +459,15 @@ function renderDeployOutcome(summary) {
 
     const batchName = summary.batch_name || _currentBatchName || 'Batch';
     title.textContent = `Deployment Successful — ${batchName}`;
-    desc.textContent  = `Rules from ${batchName} were deduplicated and deployed to the live system:`;
+    desc.textContent = `${batchName}: BLOCK-tier IPs were blocked automatically; ESCALATE-tier IPs were sent to the analyst queue.`;
 
     card.style.display = 'block';
 
     const items = [
-        { val: summary.applied,        lbl: `BLOCK Rules Applied (${batchName})` },
+        { val: summary.auto_blocked, lbl: `Auto-Blocked (${batchName})` },
         { val: summary.escalate_added, lbl: 'Sent to Analyst Queue' },
-        { val: summary.deduplicated,   lbl: 'Deduplicated (Already Active)' },
-        { val: summary.skipped_nan,    lbl: 'Skipped (No Dest Port)' },
+        { val: summary.deduplicated, lbl: 'Skipped (Already Reviewed)' },
+        { val: summary.block_failed, lbl: 'Block Failed' },
     ];
 
     tiles.innerHTML = items.map(i => `
@@ -551,9 +551,9 @@ function renderPipelineReport(report) {
     `;
 
     const rows = [
-        { badge: '<span class="badge badge-block">Block (Auto)</span>',   cls: 'score-high',   data: bd.BLOCK },
+        { badge: '<span class="badge badge-block">Block (Auto)</span>', cls: 'score-high', data: bd.BLOCK },
         { badge: '<span class="badge badge-human">Escalate (Queue)</span>', cls: 'score-medium', data: bd.ESCALATE_TO_ANALYST },
-        { badge: '<span class="badge badge-allow">Allow (Auto)</span>',   cls: 'score-low',    data: bd.ALLOW },
+        { badge: '<span class="badge badge-allow">Allow (Auto)</span>', cls: 'score-low', data: bd.ALLOW },
     ];
 
     document.getElementById('report-breakdown').innerHTML = `
@@ -561,7 +561,7 @@ function renderPipelineReport(report) {
             <thead><tr>
                 <th>Action</th>
                 <th class="num">Count</th>
-                <th class="num">% of Holdout</th>
+                <th class="num">% of Batch</th>
             </tr></thead>
             <tbody>
                 ${rows.map(r => `

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-AdapTrap Web Dashboard — restructured 3-tab version
-Tabs: Overview | Analyst Review | Import Logs
+AdapTrap Web Dashboard
+Tabs: Overview | Analyst Review | Import Logs | Firewall Rules
 
-nft permissions: this app shells out to `sudo nft …` for both status queries
-and analyst/batch BLOCK rules.
+nft permissions: this app shells out to `sudo nft …` for status queries,
+analyst-approved BLOCK rules, and handle-based rule deletion.
 
 Required sudoers line (run `sudo visudo` and add):
     <your_user> ALL=(root) NOPASSWD: /usr/sbin/nft
@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -37,12 +38,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).parent.parent
-ESCALATE_FILE = PROJECT_ROOT / "escalate_queue.json"
-REVIEWED_FILE = PROJECT_ROOT / "reviewed_decisions.json"
-IMPORTED_BATCHES_FILE = PROJECT_ROOT / "imported_batches.json"
-PIPELINE_SCRIPT = PROJECT_ROOT / "adaptrap_firewall_pipeline.py"
-PROFILES_SCRIPT = PROJECT_ROOT / "build_attacker_profiles.py"
-PYTHON = str(PROJECT_ROOT / "venv" / "bin" / "python3")
+DATA_DIR = PROJECT_ROOT / "data"
+
+ESCALATE_FILE = DATA_DIR / "escalate_queue.json"
+REVIEWED_FILE = DATA_DIR / "reviewed_decisions.json"
+IMPORTED_BATCHES_FILE = DATA_DIR / "imported_batches.json"
+
+
+def _resolve_project_script(filename: str) -> Path:
+    """Use worktree scripts when present, otherwise the configured source checkout."""
+    candidates = [PROJECT_ROOT / filename]
+    configured_root = os.environ.get("ADAPTRAP_SCRIPT_ROOT")
+    if configured_root:
+        candidates.append(Path(configured_root) / filename)
+    source_root = PROJECT_ROOT.parent.parent / "adaptrap"
+    candidates.append(source_root / filename)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+PIPELINE_SCRIPT = _resolve_project_script("dashboard/adaptrap_firewall_pipeline.py")
+PROFILES_SCRIPT = _resolve_project_script("dashboard/build_attacker_profiles.py")
+# Reuse the interpreter running Flask so background jobs work in worktrees
+# that do not contain their own virtualenv. Override when a separate runtime
+# is required.
+PYTHON = os.environ.get("ADAPTRAP_PYTHON", sys.executable)
 
 NFT_TABLE = "inet filter"
 NFT_CHAIN = "input"
@@ -58,18 +80,19 @@ _import_lock = threading.Lock()
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _build_nft_rule(source_ip: str, dest_port: int) -> str:
+def _build_nft_rule(source_ip: str) -> str:
     """Exact same rule format as adaptrap_firewall_pipeline.build_nft_rule."""
     return (
         f"sudo -n nft insert rule {NFT_TABLE} {NFT_CHAIN} "
-        f"ip saddr {source_ip} tcp dport {int(dest_port)} drop"
+        f"ip saddr {source_ip} drop"
     )
 
 
-def _apply_nft_rule(source_ip: str, dest_port: int) -> dict:
+def _apply_nft_rule(source_ip: str, dest_port: int | None = None) -> dict:
     """
-    Push a single BLOCK rule to the live nftables chain.
-    Returns {"applied": bool, "status": str, "command": str, "error": str|None}.
+    Push a single BLOCK rule to the live nftables chain, blocking the
+    source IP across all ports. dest_port is accepted for logging/display
+    purposes only — it is NOT included in the nft command itself.
     """
     import ipaddress
     try:
@@ -78,7 +101,7 @@ def _apply_nft_rule(source_ip: str, dest_port: int) -> dict:
         return {"applied": False, "status": "invalid_ip",
                 "command": "", "error": f"Rejecting malformed IP: {source_ip!r}"}
 
-    cmd = _build_nft_rule(source_ip, dest_port)
+    cmd = _build_nft_rule(source_ip)
     try:
         result = subprocess.run(
             cmd.split(),
@@ -104,28 +127,25 @@ def _apply_nft_rule(source_ip: str, dest_port: int) -> dict:
 
 
 def _apply_nft_rules_batch(rules_list: list[dict]) -> dict:
-    """
-    Apply a batch of BLOCK rules to nftables in a single atomic call via stdin.
-    Drastically reduces deployment time from ~2 minutes to <100ms.
-    """
+    """Apply BLOCK rules (full source IP, all ports) in one atomic nft call."""
     import ipaddress
-    valid_rules = []
-    failed_rules = []
+    valid_rules, failed_rules, seen_ips = [], [], set()
 
     for r in rules_list:
         ip = str(r.get("source_ip", "")).strip()
-        port = r.get("dest_port")
         try:
             ipaddress.ip_address(ip)
-            if port is None or pd.isna(port):
+            if ip in seen_ips:
                 continue
-            port_int = int(port)
+            seen_ips.add(ip)
             valid_rules.append({
                 "source_ip": ip,
-                "dest_port": port_int,
+                "dest_port": None,
                 "anomaly_score": float(r.get("anomaly_score", 0.0)),
                 "action": "BLOCK",
-                "command": f"nft insert rule {NFT_TABLE} {NFT_CHAIN} ip saddr {ip} tcp dport {port_int} drop",
+                "profile": r.get("profile", {}),
+                "packets": r.get("packets", []),
+                "command": f"nft insert rule {NFT_TABLE} {NFT_CHAIN} ip saddr {ip} drop",
             })
         except Exception as e:
             failed_rules.append({**r, "error": str(e), "applied": False})
@@ -133,42 +153,31 @@ def _apply_nft_rules_batch(rules_list: list[dict]) -> dict:
     if not valid_rules:
         return {"applied": [], "failed": failed_rules, "error": None}
 
-    # Pass all rules to nft in one atomic batch
-    payload_lines = [
-        f"insert rule {NFT_TABLE} {NFT_CHAIN} ip saddr {r['source_ip']} tcp dport {r['dest_port']} drop"
-        for r in valid_rules
-    ]
-    payload = "\n".join(payload_lines) + "\n"
+    payload = "\n".join(
+        f"insert rule {NFT_TABLE} {NFT_CHAIN} ip saddr {r['source_ip']} drop" for r in valid_rules
+    ) + "\n"
 
     try:
-        proc = subprocess.run(
-            ["sudo", "-n", "nft", "-f", "-"],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        proc = subprocess.run(["sudo", "-n", "nft", "-f", "-"], input=payload,
+                              capture_output=True, text=True, timeout=5)
         if proc.returncode == 0:
             for r in valid_rules:
                 r["applied"] = True
                 r["status"] = "ok"
-            log.info("Batch applied %d nft rules atomically in <50ms", len(valid_rules))
+            log.info("Batch applied %d nft rules atomically", len(valid_rules))
             return {"applied": valid_rules, "failed": failed_rules, "error": None}
-        else:
-            log.warning("Batch nft failed (code %d): %s. Falling back to individual rules.",
-                        proc.returncode, proc.stderr.strip() if proc.stderr else "")
+        log.warning("Batch nft failed (code %d): %s. Falling back to individual rules.",
+                    proc.returncode, proc.stderr.strip() if proc.stderr else "")
     except Exception as e:
         log.warning("Batch nft exception: %s. Falling back to individual rules.", e)
 
-    # Fallback to individual rule application if stdin batch fails
     applied = []
     for r in valid_rules:
-        res = _apply_nft_rule(r["source_ip"], r["dest_port"])
+        res = _apply_nft_rule(r["source_ip"])
         if res["applied"]:
             applied.append({**r, "applied": True, "status": "ok"})
         else:
             failed_rules.append({**r, "applied": False, "error": res.get("error")})
-
     return {"applied": applied, "failed": failed_rules, "error": None}
 
 
@@ -198,7 +207,7 @@ def get_next_batch_info() -> tuple[int, str, str]:
 
 
 def load_checkpoint(filename: str) -> dict | None:
-    filepath = PROJECT_ROOT / filename
+    filepath = DATA_DIR / "applied_checkpoints" / filename
     if filepath.exists():
         try:
             with open(filepath) as fh:
@@ -333,15 +342,37 @@ def overview():
 def analyst_review():
     return render_template("analyst_review.html", active_tab="analyst_review")
 
+@app.route("/analyst-review/<source_ip>")
+def analyst_review_detail(source_ip):
+    return render_template("analyst_review_detail.html", source_ip=source_ip, active_tab="analyst_review")
 
 @app.route("/import-logs")
 def import_logs():
     return render_template("import_logs.html", active_tab="import_logs")
 
 
+@app.route("/firewall-rules")
+def firewall_rules():
+    return render_template("firewall_rules.html", active_tab="firewall_rules")
+
+
 # ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
+
+@app.route("/api/escalate_queue/<source_ip>")
+def api_escalate_item(source_ip):
+    reviewed = load_reviewed()
+    decision = next((r for r in reviewed if r.get("source_ip") == source_ip and r.get("decision") == "BLOCK"), None)
+    if decision:
+        return jsonify({"ok": True, "item": decision, "already_reviewed": True})
+
+    data = load_escalate_queue()
+    item = next((i for i in data.get("queue", []) if i.get("source_ip") == source_ip), None)
+    if item:
+        return jsonify({"ok": True, "item": item})
+
+    return jsonify({"ok": False, "error": "Record not found"}), 404
 
 @app.route("/api/status")
 def api_status():
@@ -368,7 +399,7 @@ def api_status():
 
     # Include any reviewed BLOCKs that were applied
     reviewed = load_reviewed()
-    analyst_blocks = sum(1 for r in reviewed if r.get("decision") == "BLOCK" and r.get("nft_applied"))
+    analyst_blocks = sum(1 for r in reviewed if r.get("decision") == "BLOCK" and r.get("nft_applied") and not r.get("auto"))
     total_calculated_rules += analyst_blocks
 
     live_count = firewall.get("rule_count") if firewall.get("success") else None
@@ -448,6 +479,149 @@ def api_rules():
     rules.sort(key=lambda r: r["score"], reverse=True)
     return jsonify({"rules": rules, "total": len(rules)})
 
+def _rule_port_lookup() -> dict[str, int | None]:
+    ports = {}
+
+    for batch in get_all_applied_checkpoints():
+        for rule in batch["data"].get("rule_details", []):
+            source_ip = rule.get("source_ip")
+            if source_ip:
+                ports[str(source_ip)] = rule.get("dest_port")
+
+    for decision in load_reviewed():
+        if decision.get("decision") == "BLOCK" and decision.get("nft_applied"):
+            source_ip = decision.get("source_ip")
+            if source_ip:
+                ports[str(source_ip)] = decision.get("dest_port")
+
+    return ports
+
+def _rule_checkpoint_labels() -> dict[str, str]:
+    """Maps source_ip -> which batch/decision first flagged it, for display."""
+    labels: dict[str, str] = {}
+    for batch in get_all_applied_checkpoints():
+        for rule in batch["data"].get("rule_details", []):
+            source_ip = rule.get("source_ip")
+            if source_ip:
+                labels[str(source_ip)] = batch["name"]
+
+    for decision in load_reviewed():
+        if decision.get("decision") == "BLOCK" and decision.get("nft_applied"):
+            source_ip = decision.get("source_ip")
+            if source_ip:
+                labels[str(source_ip)] = decision.get("batch") or "Analyst Review"
+    return labels
+
+
+def _list_active_nft_rules() -> list[dict]:
+    result = subprocess.run(
+        ["sudo", "-n", "nft", "-a", "list", "chain", *NFT_TABLE.split(), NFT_CHAIN],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    labels = _rule_checkpoint_labels()
+    ports = _rule_port_lookup()
+
+    rules = []
+    for line in result.stdout.splitlines():
+        if " drop" not in f" {line}":
+            continue
+        handle_match = re.search(r"#\s*handle\s+(\d+)\s*$", line)
+        source_match = re.search(r"\bip\s+saddr\s+(\S+)", line)
+        if not handle_match or not source_match:
+            continue
+        source_ip = source_match.group(1)
+        rules.append({
+            "source_ip": source_ip,
+            "port": ports.get(source_ip),
+            "handle": int(handle_match.group(1)),
+            "checkpoint": labels.get(source_ip, "Unknown"),
+        })
+    return rules
+
+
+@app.route("/api/firewall-rules")
+def api_firewall_rules():
+    try:
+        rules = _list_active_nft_rules()
+    except subprocess.CalledProcessError as exc:
+        error = exc.stderr.strip() if exc.stderr else f"nft exited with code {exc.returncode}"
+        log.error("Unable to list active nftables rules: %s", error)
+        if "password is required" in error.lower():
+            error = (
+                "Dashboard user cannot run nft without a password. "
+                "Configure sudoers for /usr/sbin/nft with NOPASSWD."
+            )
+        return jsonify({"ok": False, "error": error}), 502
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.error("Unable to list active nftables rules: %s", exc)
+        return jsonify({"ok": False, "error": "Unable to query nftables"}), 502
+    return jsonify({"ok": True, "rules": rules, "total": len(rules)})
+
+
+@app.route("/api/delete-rule", methods=["POST"])
+def api_delete_rule():
+    body = request.get_json(force=True, silent=True) or {}
+    handle = body.get("handle")
+    if isinstance(handle, bool) or not isinstance(handle, int) or handle <= 0:
+        return jsonify({"ok": False, "error": "handle must be a positive integer"}), 400
+
+    source_ip = None
+    batch = None
+
+    # Get the currently deleted rule's metadata (source ip and the batch it came from)
+    try:
+        active_rules = _list_active_nft_rules()
+
+        for rule in active_rules:
+            if rule.get("handle") == handle:
+                source_ip = rule.get("source_ip")
+                batch = rule.get("batch") or rule.get("checkpoint")
+
+                break
+    except Exception as exc:
+        log.warning("Unable to get metadata for nftables rule handle %d: %s", handle, exc)
+
+
+    cmd = [
+        "sudo", "-n", "nft", "delete", "rule", *NFT_TABLE.split(),
+        NFT_CHAIN, "handle", str(handle),
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=5)
+    except subprocess.CalledProcessError as exc:
+        error = exc.stderr.strip() if exc.stderr else f"nft exited with code {exc.returncode}"
+        log.error("Unable to delete nftables rule handle %d: %s", handle, error)
+        if "password is required" in error.lower():
+            error = (
+                "Dashboard user cannot delete nft rules without a password. "
+                "Configure sudoers for /usr/sbin/nft with NOPASSWD."
+            )
+        return jsonify({"ok": False, "error": error}), 502
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.error("Unable to delete nftables rule handle %d: %s", handle, exc)
+        return jsonify({"ok": False, "error": "Unable to execute nftables deletion"}), 502
+
+        
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    reviewed = load_reviewed()
+
+
+    reviewed.append({
+        "source_ip": source_ip,
+        "batch": batch,
+        "decision": "DELETE",
+        "handle": handle,
+        "timestamp": timestamp,
+    })
+    save_reviewed(reviewed)
+
+    log.info("Deleted nftables rule handle %d", handle, source_ip, batch)
+
+    return jsonify({"ok": True, "handle": handle, "timestamp": timestamp, "stdout": result.stdout})
 
 @app.route("/api/attack_patterns")
 def api_attack_patterns():
@@ -502,20 +676,20 @@ def api_automation_metrics():
             last_applied = applied_at
 
     total = total_block + total_escalate + total_allow
-    automated_count = total_block + total_allow
+    automated_count = total_allow + total_block
     automation_rate = (automated_count / total * 100) if total > 0 else 0
 
     latest_config = all_checkpoints[-1]["data"].get("config", {})
 
     return jsonify({
         "automation_rate": round(automation_rate, 1),
-        "zero_touch_blocks": total_block,
+        "manual_blocks": total_block,
         "analyst_queue_depth": total_escalate,
         "auto_allows": total_allow,
         "last_auto_applied": last_applied,
         "thresholds": {
             "low_percentile": latest_config.get("low_percentile", 70),
-            "high_percentile": latest_config.get("high_percentile", 90),
+            "allow_percentile": latest_config.get("low_percentile", 70),
         },
     })
 
@@ -550,35 +724,50 @@ def api_reviewed_decisions():
     reviewed = load_reviewed()
     return jsonify({"decisions": reviewed, "total": len(reviewed)})
 
+@app.route("/api/deleted_rules")
+def api_deleted_rules():
+    reviewed = load_reviewed()
+
+    deleted = []
+    for item in reviewed:
+        if item.get("decision") == "DELETE":
+            deleted.append(item)
+
+    return jsonify({
+        "deleted": deleted,
+        "total": len(deleted),
+    })
 
 @app.route("/api/review-decision", methods=["POST"])
 def api_review_decision():
     body = request.get_json(force=True, silent=True) or {}
-    source_ip = body.get("source_ip", "").strip()
+    source_ip = (body.get("source_ip") or "").strip()
     dest_port = body.get("dest_port")
     decision = body.get("decision", "").lower()
     batch_name = body.get("batch", "Analyst Review")
+    profile = body.get("profile", {})
+    packets = body.get("packets", [])
 
-    if not source_ip or dest_port is None or decision not in ("block", "allow"):
-        return jsonify({"ok": False, "error": "Missing or invalid fields (source_ip, dest_port, decision)"}), 400
+    if not source_ip or decision not in ("block", "allow"):
+        return jsonify({"ok": False, "error": "Missing or invalid fields (source_ip, decision)"}), 400
 
-    try:
-        dest_port = int(dest_port)
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "dest_port must be an integer"}), 400
+    if dest_port is not None:
+        try:
+            dest_port = int(dest_port)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "dest_port must be an integer"}), 400
 
     timestamp = datetime.now(timezone.utc).isoformat()
     nft_result = None
 
     if decision == "block":
-        nft_result = _apply_nft_rule(source_ip, dest_port)
-        # In case live sudo execution failed in demo environment, ensure decision is recorded cleanly
+        nft_result = _apply_nft_rule(source_ip)
         if not nft_result.get("applied"):
             log.warning("Direct sudo nft execution failed (%s). Recording decision for demo.", nft_result.get("error"))
             nft_result = {
                 "applied": True,
                 "status": "ok",
-                "command": _build_nft_rule(source_ip, dest_port),
+                "command": _build_nft_rule(source_ip),
                 "error": None
             }
 
@@ -590,10 +779,12 @@ def api_review_decision():
         "timestamp": timestamp,
         "batch": batch_name,
         "nft_applied": nft_result["applied"] if nft_result else False,
+        "profile": profile,
+        "packets": packets,
     })
     save_reviewed(reviewed)
 
-    log.info("Analyst %s: %s:%s at %s (%s)", decision.upper(), source_ip, dest_port, timestamp, batch_name)
+    log.info("Analyst %s: %s at %s (%s)", decision.upper(), source_ip, timestamp, batch_name)
     return jsonify({
         "ok": True,
         "decision": decision.upper(),
@@ -605,88 +796,23 @@ def api_review_decision():
     })
 
 
-# ---------------------------------------------------------------------------
-# Import Logs — file upload + streaming profile build
-# ---------------------------------------------------------------------------
-
-def _run_import_job(job_id: str, csv_path: str, out_dir: str, prefix: str) -> None:
+def _run_training_job(job_id: str, out_dir: str) -> None:
+    """Scores the uploaded raw capture against the published M3 checkpoint.
+    No training happens here — M3 is frozen. Kept the name/status values
+    ('training'/'training_done') for compatibility with the existing
+    frontend state machine, even though nothing is being trained."""
     def _push(line: str) -> None:
         with _import_lock:
             if job_id in _import_jobs:
                 _import_jobs[job_id]["log"].append(line)
 
     try:
-        cmd = [PYTHON, str(PROFILES_SCRIPT),
-               "--raw-csv", csv_path,
-               "--out-dir", out_dir,
-               "--prefix", prefix]
-
-        _push(f"[adaptrap] Running: {' '.join(cmd)}")
-
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-
-        if proc.stdout:
-            for line in proc.stdout:
-                _push(line.rstrip())
-
-        proc.wait()
-
-        if proc.returncode != 0:
-            with _import_lock:
-                _import_jobs[job_id]["status"] = "error"
-                _import_jobs[job_id]["error"] = f"Profile builder exited with code {proc.returncode}"
-            return
-
-        summary = {}
-        for split_name in ("train", "validation", "holdout"):
-            split_path = Path(out_dir) / f"{prefix}_{split_name}.csv"
-            if split_path.exists():
-                try:
-                    row_count = sum(1 for _ in open(split_path)) - 1
-                    summary[split_name] = row_count
-                except Exception:
-                    summary[split_name] = "?"
-
-        summary["total"] = sum(v for v in summary.values() if isinstance(v, int))
-        summary["prefix"] = prefix
-        summary["out_dir"] = out_dir
-
-        with _import_lock:
-            _import_jobs[job_id]["status"] = "profiles_done"
-            _import_jobs[job_id]["summary"] = summary
-
-        _push(f"[adaptrap] ✓ Profiles complete: {summary}")
-
-    except Exception as exc:
-        with _import_lock:
-            if job_id in _import_jobs:
-                _import_jobs[job_id]["status"] = "error"
-                _import_jobs[job_id]["error"] = str(exc)
-        _push(f"[adaptrap] ERROR: {exc}")
-
-
-def _run_training_job(job_id: str, prefix: str, out_dir: str, contamination: float = 0.05) -> None:
-    def _push(line: str) -> None:
-        with _import_lock:
-            if job_id in _import_jobs:
-                _import_jobs[job_id]["log"].append(line)
-
-    try:
-        train_csv = str(Path(out_dir) / f"{prefix}_train.csv")
-        holdout_csv = str(Path(out_dir) / f"{prefix}_holdout.csv")
-        report_path = str(Path(out_dir) / f"{prefix}_import_checkpoint.json")
+        raw_csv = str(Path(out_dir) / "raw_capture.csv")
+        report_path = str(Path(out_dir) / "import_checkpoint.json")
 
         cmd = [
             PYTHON, str(PIPELINE_SCRIPT),
-            "--train-csv", train_csv,
-            "--holdout-csv", holdout_csv,
-            "--contamination", str(contamination),
+            "--raw-csv", raw_csv,
             "--out-report", report_path,
         ]
 
@@ -721,7 +847,7 @@ def _run_training_job(job_id: str, prefix: str, out_dir: str, contamination: flo
             _import_jobs[job_id]["status"] = "training_done"
             _import_jobs[job_id]["pipeline_report"] = report
 
-        _push("[adaptrap] ✓ Training complete.")
+        _push("[adaptrap] ✓ Scoring complete.")
 
     except Exception as exc:
         with _import_lock:
@@ -760,17 +886,15 @@ def api_import_upload():
 
     job_id = str(uuid.uuid4())
     batch_num, batch_id, batch_name = get_next_batch_info()
-    prefix = batch_id
 
     with _import_lock:
         _import_jobs[job_id] = {
-            "status": "running",
-            "log": [],
+            "status": "profiles_done",  # file saved and ready to score — no separate build step needed
+            "log": [f"[adaptrap] Saved upload to {csv_path}"],
             "summary": None,
             "pipeline_report": None,
             "deploy_summary": None,
             "error": None,
-            "prefix": prefix,
             "batch_number": batch_num,
             "batch_id": batch_id,
             "batch_name": batch_name,
@@ -778,20 +902,12 @@ def api_import_upload():
             "filename": f.filename,
         }
 
-    thread = threading.Thread(
-        target=_run_import_job,
-        args=(job_id, csv_path, tmp_dir, prefix),
-        daemon=True,
-    )
-    thread.start()
-
     return jsonify({
         "ok": True,
         "job_id": job_id,
         "batch_number": batch_num,
         "batch_name": batch_name,
     })
-
 
 @app.route("/api/import/status/<job_id>")
 def api_import_status(job_id: str):
@@ -827,11 +943,8 @@ def api_import_train(job_id: str):
     if job["status"] not in ("profiles_done", "training_done", "deployed"):
         return jsonify({
             "ok": False,
-            "error": f"Job is not ready for training (current status: {job['status']})"
+            "error": f"Job is not ready for scoring (current status: {job['status']})"
         }), 400
-
-    body = request.get_json(force=True, silent=True) or {}
-    contamination = float(body.get("contamination", 0.05))
 
     with _import_lock:
         _import_jobs[job_id]["status"] = "training"
@@ -840,7 +953,7 @@ def api_import_train(job_id: str):
 
     thread = threading.Thread(
         target=_run_training_job,
-        args=(job_id, job["prefix"], job["out_dir"], contamination),
+        args=(job_id, job["out_dir"]),
         daemon=True,
     )
     thread.start()
@@ -850,14 +963,7 @@ def api_import_train(job_id: str):
 
 @app.route("/api/import/deploy/<job_id>", methods=["POST"])
 def api_import_deploy(job_id: str):
-    """
-    Unified 1-click deployment:
-    1. Reads candidate BLOCK rules from the trained import job.
-    2. Deduplicates candidate IPs against all currently active rules.
-    3. Pushes new BLOCK rules to live nftables.
-    4. Extracts ESCALATE candidates (70th–90th percentile) and adds to Analyst Review queue.
-    5. Saves checkpoint & registers batch in imported_batches.json.
-    """
+    """Auto-block the BLOCK tier, queue the ESCALATE tier for analyst review, save checkpoint."""
     with _import_lock:
         job = _import_jobs.get(job_id)
 
@@ -865,11 +971,11 @@ def api_import_deploy(job_id: str):
         return jsonify({"ok": False, "error": "Unknown job_id"}), 404
 
     if job["status"] not in ("training_done", "deployed"):
-        return jsonify({"ok": False, "error": f"Job is not trained yet (current status: {job['status']})"}), 400
+        return jsonify({"ok": False, "error": f"Job is not scored yet (current status: {job['status']})"}), 400
 
     report = job.get("pipeline_report")
     if not report:
-        report_path = Path(job["out_dir"]) / f"{job['prefix']}_import_checkpoint.json"
+        report_path = Path(job["out_dir"]) / "import_checkpoint.json"
         if report_path.exists():
             with open(report_path) as fh:
                 report = json.load(fh)
@@ -885,84 +991,82 @@ def api_import_deploy(job_id: str):
         job["batch_id"] = batch_id
         job["batch_name"] = batch_name
 
-    # Collect existing blocked IPs across all current checkpoints & reviewed blocks
-    existing_rules_data = api_rules().get_json() or {}
-    active_blocked_ips = {r["ip"] for r in existing_rules_data.get("rules", [])}
-
     block_candidates = report.get("rule_details", [])
-    applied_rules = []
-    skipped_nan = 0
-    deduplicated = 0
-    failed = 0
-
+    escalate_candidates = report.get("escalate_details", [])
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    rules_to_deploy = []
-    for r in block_candidates:
-        source_ip = r.get("source_ip")
-        dest_port = r.get("dest_port")
+    reviewed = load_reviewed()
+    reviewed_ips = {r["source_ip"] for r in reviewed if r.get("source_ip")}
 
-        if dest_port is None or pd.isna(dest_port):
+    skipped_nan = 0
+    deduplicated = 0
+
+    # 1) BLOCK tier: apply automatically, skipping IPs an analyst already ruled on
+    to_block = []
+    for r in block_candidates:
+        ip = r.get("source_ip")
+        if not ip:
             skipped_nan += 1
             continue
-
-        if source_ip in active_blocked_ips:
+        if ip in reviewed_ips:
             deduplicated += 1
             continue
+        to_block.append(r)
 
-        rules_to_deploy.append(r)
-        active_blocked_ips.add(source_ip)
+    batch_result = _apply_nft_rules_batch(to_block)
+    applied_rules = batch_result["applied"]
+    failed = len(batch_result["failed"])
 
-    # Batch apply new rules
-    if rules_to_deploy:
-        batch_res = _apply_nft_rules_batch(rules_to_deploy)
-        applied_rules = batch_res.get("applied", [])
-        # Ensure candidate rules are fully recorded for the dashboard
-        if not applied_rules:
-            for r in rules_to_deploy:
-                applied_rules.append({
-                    "source_ip": r["source_ip"],
-                    "dest_port": int(r["dest_port"]),
-                    "anomaly_score": float(r.get("anomaly_score", 0.0)),
-                    "action": "BLOCK",
-                    "command": f"nft insert rule {NFT_TABLE} {NFT_CHAIN} ip saddr {r['source_ip']} tcp dport {int(r['dest_port'])} drop",
-                    "applied": True,
-                    "status": "ok",
-                    "batch": batch_name,
-                })
-        else:
-            for r in applied_rules:
-                r["batch"] = batch_name
+    # Record auto-blocks so the detail page, audit trail and Firewall Rules tab can find them
+    for r in applied_rules:
+        reviewed.append({
+            "source_ip": r["source_ip"],
+            "dest_port": None,
+            "decision": "BLOCK",
+            "timestamp": timestamp,
+            "batch": batch_name,
+            "nft_applied": True,
+            "auto": True,
+            "anomaly_score": r.get("anomaly_score"),
+            "profile": r.get("profile", {}),
+            "packets": r.get("packets", []),
+        })
+        reviewed_ips.add(r["source_ip"])
+    save_reviewed(reviewed)
 
-    # Populate Analyst Queue with candidate ESCALATE threats
-    escalate_items = report.get("escalate_details", [])
+    # 2) ESCALATE tier: queue for analyst review
     queue_data = load_escalate_queue()
     current_queue = queue_data.get("queue", [])
-    reviewed = load_reviewed()
-    reviewed_ips = {rev["source_ip"] for rev in reviewed}
     existing_queue_ips = {item["source_ip"] for item in current_queue}
 
     escalate_added = 0
-    for esc in escalate_items:
+    for esc in escalate_candidates:
         ip = esc.get("source_ip")
-        if ip and ip not in reviewed_ips and ip not in existing_queue_ips:
-            esc_entry = {
-                "source_ip": ip,
-                "dest_port": int(esc["dest_port"]) if esc.get("dest_port") is not None and not pd.isna(esc.get("dest_port")) else None,
-                "anomaly_score": float(esc.get("anomaly_score", 0.0)),
-                "action": "ESCALATE_TO_ANALYST",
-                "batch": batch_name,
-            }
-            current_queue.insert(0, esc_entry)  # Newest batch at top of queue
-            existing_queue_ips.add(ip)
-            escalate_added += 1
+        if not ip:
+            skipped_nan += 1
+            continue
+        if ip in reviewed_ips or ip in existing_queue_ips:
+            deduplicated += 1
+            continue
+        current_queue.insert(0, {
+            "source_ip": ip,
+            "dest_port": None,
+            "anomaly_score": float(esc.get("anomaly_score", 0.0)),
+            "action": "ESCALATE_TO_ANALYST",
+            "batch": batch_name,
+            "profile": esc.get("profile", {}),
+            "packets": esc.get("packets", []),
+        })
+        existing_queue_ips.add(ip)
+        escalate_added += 1
 
     queue_data["queue"] = current_queue
     queue_data["total"] = len(current_queue)
     queue_data["last_updated"] = timestamp
     save_escalate_queue(queue_data)
 
-    # Save applied checkpoint for this batch
+    # 3) Save checkpoint for this batch
+    total_candidates = len(block_candidates) + len(escalate_candidates)
     applied_checkpoint = dict(report)
     applied_checkpoint["applied_at"] = timestamp
     applied_checkpoint["dry_run"] = False
@@ -972,20 +1076,20 @@ def api_import_deploy(job_id: str):
     applied_checkpoint["rule_details"] = applied_rules
     applied_checkpoint["application_summary"] = {
         "batch_name": batch_name,
-        "total_candidates": len(block_candidates),
+        "total_candidates": total_candidates,
         "deduplicated": deduplicated,
         "skipped_nan": skipped_nan,
         "applied": len(applied_rules),
+        "auto_blocked": len(applied_rules),
         "failed": failed,
         "escalate_added": escalate_added,
     }
 
     checkpoint_filename = f"{batch_id}_applied_checkpoint.json"
-    checkpoint_path = PROJECT_ROOT / checkpoint_filename
+    checkpoint_path = DATA_DIR / "applied_checkpoints" / checkpoint_filename
     with open(checkpoint_path, "w") as fh:
         json.dump(applied_checkpoint, fh, indent=2)
 
-    # Register in imported_batches.json
     batches = load_imported_batches()
     batches = [b for b in batches if b.get("batch_id") != batch_id]
     batches.append({
@@ -1002,8 +1106,10 @@ def api_import_deploy(job_id: str):
     deploy_summary = {
         "batch_name": batch_name,
         "batch_id": batch_id,
-        "total_candidates": len(block_candidates),
+        "total_candidates": total_candidates,
         "applied": len(applied_rules),
+        "auto_blocked": len(applied_rules),
+        "block_failed": failed,
         "deduplicated": deduplicated,
         "skipped_nan": skipped_nan,
         "failed": failed,
@@ -1015,9 +1121,7 @@ def api_import_deploy(job_id: str):
         job["status"] = "deployed"
         job["deploy_summary"] = deploy_summary
 
-    log.info("%s deployed: %d applied, %d deduplicated, %d escalated",
-             batch_name, len(applied_rules), deduplicated, escalate_added)
-
+    log.info("%s: %d auto-blocked, %d queued for analyst review", batch_name, len(applied_rules), escalate_added)
     return jsonify({"ok": True, "summary": deploy_summary})
 
 

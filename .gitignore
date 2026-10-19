@@ -13,6 +13,8 @@ build/
 # ── Large raw honeypot captures (>100MB — GitHub hard limit) ───────
 CICHoneynet_July2-9.csv
 CICHoneynet_July1.csv
+!datasets/.gitkeep
+datasets/*
 *.pcap
 *.pcapng
 
@@ -24,6 +26,9 @@ adaptrap_import_*/
 reviewed_decisions.json
 escalate_queue.json
 imported_batches.json
+data/*
+!data/.gitkeep
+
 
 # ── Stale/duplicate batch artifacts ────────────────────────────────
 batch2__train.csv
